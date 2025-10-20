@@ -1,4 +1,3 @@
-
 // server.js
 // هذا الملف هو الواجهة الخلفية التي ستعمل على منصة Render
 
@@ -29,91 +28,111 @@ if (!process.env.API_KEY) {
 }
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-// متغيرات لتخزين حالة الاتصال ورمز QR
-let connectionStatus = 'DISCONNECTED';
-let qrCodeDataUrl = null;
+// متغيرات لتخزين الحالة (الآن أقل اعتمادًا على المتغيرات اليدوية)
 let client;
+let qrCodeDataUrl = null;
+let serverLogs = [];
+
+// دالة لإضافة سجلات مع طابع زمني
+const addLog = (message) => {
+  const timestamp = new Date().toLocaleString('en-US', { timeZone: 'UTC' });
+  const logMessage = `[${timestamp} UTC] ${message}`;
+  console.log(logMessage);
+  serverLogs.unshift(logMessage); // Add to the beginning
+  if (serverLogs.length > 15) {
+    serverLogs.pop(); // Keep only the last 15 logs
+  }
+};
 
 // دالة مركزية لإنشاء وتهيئة عميل WhatsApp جديد
 function initializeClient() {
-  console.log('Initializing a new WhatsApp client instance...');
+  addLog('Creating and initializing a new WhatsApp client instance...');
   client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
       args: ['--no-sandbox', '--disable-setuid-sandbox'],
-      headless: true, // تأكد من تشغيله في وضع headless على الخادم
+      headless: true,
     },
   });
 
+  // مسح رمز QR القديم عند بدء تهيئة جديدة
+  qrCodeDataUrl = null;
+
   client.on('qr', async (qr) => {
-    console.log('QR RECEIVED');
-    connectionStatus = 'PENDING_QR_SCAN';
+    addLog('QR Code Received. Please scan.');
     qrCodeDataUrl = await qrcode.toDataURL(qr);
   });
 
   client.on('ready', () => {
-    console.log('Client is ready!');
-    connectionStatus = 'CONNECTED';
-    qrCodeDataUrl = null;
+    addLog('Client is ready! Connection established.');
+    qrCodeDataUrl = null; // لم نعد بحاجة لرمز QR بعد الآن
   });
 
   client.on('disconnected', (reason) => {
-    console.log('Client was logged out', reason);
-    connectionStatus = 'DISCONNECTED';
+    addLog(`Client was logged out. Reason: ${reason}. Please reconnect.`);
     qrCodeDataUrl = null;
-    // لا تقم بإعادة التهيئة هنا لتجنب المشاكل، دع التحكم للمستخدم عبر /reset
+    client = null; // تدمير مرجع العميل لضمان إنشاء واحد جديد
   });
 
   client.on('auth_failure', (msg) => {
-    console.error('AUTHENTICATION FAILURE', msg);
-    connectionStatus = 'ERROR';
-    qrCodeDataUrl = null;
+    addLog(`Authentication Failure: ${msg}. Session is invalid.`);
   });
 
-  console.log('Starting client initialization...');
   client.initialize().catch(err => {
-    console.error('Client initialization failed:', err);
-    connectionStatus = 'ERROR';
+    addLog(`FATAL: Client initialization failed: ${err.message}`);
   });
 }
 
 // ---- ENDPOINTS API ----
 
-// نقطة نهاية محسّنة لإعادة تعيين جلسة العميل
 app.post('/reset', async (req, res) => {
-  console.log('Received request to reset client session.');
-  connectionStatus = 'CONNECTING'; // تحديث الحالة فورًا
-  qrCodeDataUrl = null;
+  addLog('Received request to reset client session.');
+  if (client) {
+    try {
+      addLog('Destroying previous client instance...');
+      await client.destroy();
+      addLog('Previous client instance destroyed.');
+    } catch (error) {
+      addLog(`Warning: Error destroying client. It might have already been down. ${error.message}`);
+    } finally {
+      client = null;
+      qrCodeDataUrl = null;
+    }
+  }
+  initializeClient();
+  res.status(200).json({ message: 'Client session reset initiated.' });
+});
+
+// نقطة نهاية للحالة تعتمد على المصدر الموثوق
+app.get('/status', async (req, res) => {
+  if (!client) {
+    return res.json({ status: 'DISCONNECTED', qrCode: null, logs: serverLogs });
+  }
 
   try {
-    if (client) {
-      console.log('Destroying previous client instance...');
-      await client.destroy();
-      console.log('Previous client instance destroyed.');
+    const state = await client.getState();
+    if (state === 'CONNECTED') {
+      return res.json({ status: 'CONNECTED', qrCode: null, logs: serverLogs });
+    } else if (qrCodeDataUrl) {
+      return res.json({ status: 'PENDING_QR_SCAN', qrCode: qrCodeDataUrl, logs: serverLogs });
+    } else {
+      return res.json({ status: 'CONNECTING', qrCode: null, logs: serverLogs });
     }
   } catch (error) {
-    console.warn('Error destroying client, it might have been already down. Continuing with re-initialization.', error.message);
-  } finally {
-    initializeClient(); // إنشاء وتهيئة عميل جديد ونظيف
-    res.status(200).json({ message: 'Client session reset initiated.' });
+    addLog(`Client state check failed: ${error.message}. Client is likely down or uninitialized.`);
+    return res.json({ status: 'ERROR', qrCode: null, logs: serverLogs });
   }
 });
 
-// 1. نقطة نهاية لجلب حالة الاتصال
-app.get('/status', (req, res) => {
-  res.json({
-    status: connectionStatus,
-    qrCode: qrCodeDataUrl,
-  });
-});
 
-// 2. نقطة نهاية لتوليد رسالة باستخدام Gemini AI
+// نقطة نهاية لتوليد رسالة باستخدام Gemini AI
 app.post('/generate-message', async (req, res) => {
   const { prompt } = req.body;
   if (!prompt) {
     return res.status(400).json({ error: 'Prompt is required.' });
   }
 
+  addLog('Generating AI message...');
   try {
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
@@ -124,25 +143,42 @@ app.post('/generate-message', async (req, res) => {
         topP: 0.95,
       },
     });
+    addLog('AI message generated successfully.');
     res.json({ message: response.text });
   } catch (error) {
-    console.error('Error calling Gemini API:', error);
+    addLog(`Error calling Gemini API: ${error.message}`);
     res.status(500).json({ error: 'Failed to generate message from Gemini API.' });
   }
 });
 
-// 3. نقطة نهاية لإرسال الرسائل
+// نقطة نهاية لإرسال الرسائل مع فحص صحة إجباري
 app.post('/send', async (req, res) => {
   const { numbers, message } = req.body;
 
-  if (connectionStatus !== 'CONNECTED') {
-    return res.status(400).json({ error: 'WhatsApp client is not connected.' });
+  // --- فحص الصحة الإجباري ---
+  if (!client) {
+    addLog('Send failed: Client does not exist.');
+    return res.status(400).json({ error: 'عميل WhatsApp غير مهيأ. يرجى الاتصال أولاً.' });
   }
+  try {
+    const currentState = await client.getState();
+    if (currentState !== 'CONNECTED') {
+      const errorMsg = `عميل WhatsApp ليس جاهزًا. الحالة الحالية: ${currentState || 'غير معروف'}`;
+      addLog(`Send failed: ${errorMsg}`);
+      return res.status(400).json({ error: errorMsg });
+    }
+  } catch (error) {
+    const errorMsg = 'تعذر التحقق من حالة اتصال WhatsApp. قد تكون الخدمة قيد إعادة التشغيل.';
+    addLog(`Send failed: ${errorMsg} - ${error.message}`);
+    return res.status(500).json({ error: errorMsg });
+  }
+  // --- نهاية فحص الصحة ---
 
   if (!numbers || !message || !Array.isArray(numbers) || numbers.length === 0) {
-    return res.status(400).json({ error: 'Numbers array and message are required.' });
+    return res.status(400).json({ error: 'مصفوفة الأرقام والرسالة مطلوبة.' });
   }
-
+  
+  addLog(`Sending message to ${numbers.length} numbers...`);
   let successCount = 0;
   let failedCount = 0;
   const failedNumbers = [];
@@ -153,12 +189,13 @@ app.post('/send', async (req, res) => {
       await client.sendMessage(chatId, message);
       successCount++;
     } catch (error) {
-      console.error(`Failed to send message to ${number}:`, error.message);
+      addLog(`Failed to send message to ${number}: ${error.message}`);
       failedCount++;
       failedNumbers.push(number);
     }
   }
-
+  
+  addLog(`Sending complete. Success: ${successCount}, Failed: ${failedCount}.`);
   res.json({
     success: successCount,
     failed: failedCount,
