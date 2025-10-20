@@ -1,3 +1,4 @@
+
 // server.js
 // هذا الملف هو الواجهة الخلفية التي ستعمل على منصة Render
 
@@ -23,43 +24,76 @@ if (!process.env.API_KEY) {
 }
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-// إعداد عميل WhatsApp
-const client = new Client({
-  authStrategy: new LocalAuth(),
-  // خاصية puppeteer ضرورية للعمل على Render
-  puppeteer: {
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  },
-});
-
 // متغيرات لتخزين حالة الاتصال ورمز QR
 let connectionStatus = 'DISCONNECTED';
 let qrCodeDataUrl = null;
+let client; // تعريف العميل هنا ليتم إعادة إنشائه
 
-client.on('qr', async (qr) => {
-  console.log('QR RECEIVED');
-  connectionStatus = 'PENDING_QR_SCAN';
-  // تحويل نص QR إلى صورة بتشفير base64 ليتم عرضها في المتصفح
-  qrCodeDataUrl = await qrcode.toDataURL(qr);
-});
+function createWhatsAppClient() {
+  console.log('Creating a new WhatsApp client instance...');
+  client = new Client({
+    authStrategy: new LocalAuth(),
+    // خاصية puppeteer ضرورية للعمل على Render
+    puppeteer: {
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    },
+  });
 
-client.on('ready', () => {
-  console.log('Client is ready!');
-  connectionStatus = 'CONNECTED';
-  qrCodeDataUrl = null;
-});
+  client.on('qr', async (qr) => {
+    console.log('QR RECEIVED');
+    connectionStatus = 'PENDING_QR_SCAN';
+    // تحويل نص QR إلى صورة بتشفير base64 ليتم عرضها في المتصفح
+    qrCodeDataUrl = await qrcode.toDataURL(qr);
+  });
 
-client.on('disconnected', (reason) => {
-  console.log('Client was logged out', reason);
-  connectionStatus = 'DISCONNECTED';
-  qrCodeDataUrl = null;
-  // إعادة تشغيل العميل لمحاولة الاتصال مجددًا
+  client.on('ready', () => {
+    console.log('Client is ready!');
+    connectionStatus = 'CONNECTED';
+    qrCodeDataUrl = null;
+  });
+
+  client.on('disconnected', (reason) => {
+    console.log('Client was logged out', reason);
+    connectionStatus = 'DISCONNECTED';
+    qrCodeDataUrl = null;
+    // لا تقم بإعادة التهيئة تلقائيًا هنا لتجنب الحلقات اللانهائية
+    // سيتم التحكم في إعادة الاتصال عبر نقطة النهاية /reset
+  });
+
+  client.on('auth_failure', (msg) => {
+    console.error('AUTHENTICATION FAILURE', msg);
+    connectionStatus = 'ERROR';
+  });
+
   client.initialize();
-});
+}
 
-client.initialize();
+// إنشاء العميل لأول مرة عند بدء التشغيل
+createWhatsAppClient();
+
 
 // ---- ENDPOINTS API ----
+
+// نقطة نهاية جديدة ومحسّنة لإعادة تعيين جلسة العميل
+app.post('/reset', async (req, res) => {
+  console.log('Received request to reset client session.');
+  try {
+    // 1. تدمير الجلسة الحالية تمامًا
+    if (client) {
+      await client.destroy();
+      console.log('Previous client session destroyed.');
+    }
+  } catch (error) {
+    console.warn('Could not destroy client, it might have been already destroyed or in a bad state. Continuing...');
+  } finally {
+    // 2. إعادة تعيين متغيرات الحالة وإنشاء عميل جديد ونظيف
+    connectionStatus = 'DISCONNECTED';
+    qrCodeDataUrl = null;
+    createWhatsAppClient(); // هذه الدالة ستقوم بـ initialize
+    console.log('New client instance created and is initializing.');
+    res.status(200).json({ message: 'Client session has been reset successfully.' });
+  }
+});
 
 // 1. نقطة نهاية لجلب حالة الاتصال
 app.get('/status', (req, res) => {

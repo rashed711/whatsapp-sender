@@ -28,6 +28,24 @@ export const getStatus = async () => {
 };
 
 /**
+ * إرسال طلب لإعادة تعيين جلسة WhatsApp على الخادم.
+ */
+export const resetSession = async () => {
+  try {
+    const response = await fetch(`${BACKEND_URL}/reset`, {
+      method: 'POST',
+    });
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`فشل إعادة تعيين الجلسة: ${errorText}`);
+    }
+    return response.json();
+  } catch (error) {
+    handleFetchError(error);
+  }
+};
+
+/**
  * إرسال الرسائل عبر الخادم الخلفي.
  * @param numbers - مصفوفة من أرقام الهواتف.
  * @param message - نص الرسالة.

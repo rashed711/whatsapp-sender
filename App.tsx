@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { generateMessage } from './services/geminiService';
-import { getStatus, sendMessages } from './api/whatsappService';
+import { getStatus, sendMessages, resetSession } from './api/whatsappService';
 import { Card } from './components/Card';
 import { Button } from './components/Button';
 import { Spinner } from './components/Spinner';
@@ -8,6 +8,7 @@ import { WhatsAppIcon, CheckCircleIcon, PaperAirplaneIcon, SparklesIcon } from '
 
 enum ConnectionStatus {
   DISCONNECTED,
+  CONNECTING,
   PENDING_QR_SCAN,
   CONNECTED,
   ERROR,
@@ -18,6 +19,8 @@ interface SendResult {
   failed: number;
   failedNumbers?: string[];
 }
+
+const MAX_POLL_RETRIES = 10; // سنحاول 10 مرات (حوالي 30 ثانية) قبل إعلان الفشل
 
 const App: React.FC = () => {
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>(ConnectionStatus.DISCONNECTED);
@@ -31,55 +34,85 @@ const App: React.FC = () => {
   const [sendResult, setSendResult] = useState<SendResult | null>(null);
   
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollRetriesRef = useRef<number>(0);
+
+  const stopPolling = useCallback(() => {
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+  }, []);
 
   const pollStatus = useCallback(async () => {
+    // لا داعي للاستعلام إذا كنا متصلين بالفعل أو حدث خطأ
+    if (connectionStatus === ConnectionStatus.CONNECTED || connectionStatus === ConnectionStatus.ERROR) {
+      stopPolling();
+      return;
+    }
+  
     try {
       const data = await getStatus();
+      pollRetriesRef.current = 0; // نجح الاتصال، أعد تعيين عداد المحاولات
+  
       if (data.status === 'CONNECTED') {
         setConnectionStatus(ConnectionStatus.CONNECTED);
         setQrCode(null);
         setStatusMessage('تم الاتصال بنجاح!');
-        if (intervalRef.current) {
-          clearInterval(intervalRef.current);
-          intervalRef.current = null;
-        }
+        stopPolling();
       } else if (data.status === 'PENDING_QR_SCAN') {
+        // بمجرد الحصول على رمز QR، نظل في هذه الحالة حتى يتم الاتصال بنجاح
+        // هذا يمنع الواجهة من الارتداد لحالة "جاري الاتصال" إذا انقطع الخادم مؤقتًا
         setConnectionStatus(ConnectionStatus.PENDING_QR_SCAN);
         setQrCode(data.qrCode);
         setStatusMessage('يرجى مسح الرمز ضوئيًا باستخدام WhatsApp.');
-      } else {
-        setConnectionStatus(ConnectionStatus.DISCONNECTED);
-        setStatusMessage('غير متصل. حاول الاتصال.');
+      } else if (connectionStatus === ConnectionStatus.CONNECTING) {
+        // إذا كنا لا نزال في مرحلة الاتصال ولم يأت الرمز بعد
+        setStatusMessage('في انتظار رمز QR من الخادم...');
       }
     } catch (error) {
-      console.error('Polling error:', error);
-      setStatusMessage((error as Error).message || 'خطأ غير معروف في الاتصال بالخادم.');
-      setConnectionStatus(ConnectionStatus.ERROR);
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-        intervalRef.current = null; // هام: إعادة التعيين للسماح بإعادة المحاولة
+      pollRetriesRef.current += 1;
+      console.warn(` فشل الاتصال بالخادم، المحاولة رقم ${pollRetriesRef.current}`);
+  
+      if (pollRetriesRef.current >= MAX_POLL_RETRIES) {
+        console.error('Polling error after max retries:', error);
+        setStatusMessage((error as Error).message || 'فشل الاتصال بالخادم بعد عدة محاولات.');
+        setConnectionStatus(ConnectionStatus.ERROR);
+        stopPolling();
       }
     }
-  }, []);
+  }, [stopPolling, connectionStatus]);
 
-  const handleConnect = () => {
-    setStatusMessage('جاري طلب رمز QR من الخادم...');
+  const handleConnect = async () => {
+    // إعادة تعيين الحالة لبدء عملية جديدة
+    setConnectionStatus(ConnectionStatus.CONNECTING);
+    setStatusMessage('جاري إعادة تعيين الجلسة السابقة...');
     setSendResult(null);
-    setConnectionStatus(ConnectionStatus.DISCONNECTED); // Reset visual state
-    if (!intervalRef.current) {
-      pollStatus(); // Call once immediately
-      intervalRef.current = setInterval(pollStatus, 3000); // Then start polling
+    setQrCode(null);
+    pollRetriesRef.current = 0;
+    
+    // التأكد من عدم وجود مؤقت يعمل بالفعل
+    stopPolling();
+
+    try {
+      // الخطوة الجديدة: إجبار الخادم على بدء جلسة جديدة ونظيفة
+      await resetSession();
+
+      setStatusMessage('جاري الاتصال بالخادم... قد يستغرق الأمر ما يصل إلى 50 ثانية.');
+      pollStatus(); // استدعاء فوري للمحاولة الأولى
+      intervalRef.current = setInterval(pollStatus, 3000); // ثم البدء في الاستعلام الدوري
+    } catch (error) {
+      console.error('Failed to reset session:', error);
+      setStatusMessage((error as Error).message || 'فشل في بدء جلسة جديدة على الخادم.');
+      setConnectionStatus(ConnectionStatus.ERROR);
     }
   };
   
   useEffect(() => {
-    // Cleanup on component unmount
+    // تنظيف المؤقت عند إغلاق المكون
     return () => {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-      }
+      stopPolling();
     };
-  }, []);
+  }, [stopPolling]);
 
   const handleGenerateMessage = async () => {
     if (!geminiPrompt.trim()) {
@@ -134,6 +167,8 @@ const App: React.FC = () => {
     }
   };
 
+  const isConnectButtonDisabled = connectionStatus === ConnectionStatus.CONNECTING || connectionStatus === ConnectionStatus.PENDING_QR_SCAN;
+
   return (
     <div className="bg-gray-100 min-h-screen flex items-center justify-center p-4 font-[Tahoma]">
       <div className="w-full max-w-4xl mx-auto">
@@ -151,8 +186,10 @@ const App: React.FC = () => {
             </h2>
             <div className="flex flex-col items-center justify-center h-full min-h-[300px]">
               {connectionStatus !== ConnectionStatus.CONNECTED && (
-                <Button onClick={handleConnect} disabled={!!intervalRef.current}>
-                  {!!intervalRef.current ? <><Spinner /> جارٍ الاتصال...</> : 'الاتصال بـ WhatsApp'}
+                <Button onClick={handleConnect} disabled={isConnectButtonDisabled}>
+                  {connectionStatus === ConnectionStatus.CONNECTING || connectionStatus === ConnectionStatus.PENDING_QR_SCAN 
+                    ? <><Spinner /> جارٍ الاتصال...</> 
+                    : 'الاتصال بـ WhatsApp'}
                 </Button>
               )}
               {connectionStatus === ConnectionStatus.PENDING_QR_SCAN && qrCode && (
@@ -164,7 +201,7 @@ const App: React.FC = () => {
                   <p className="mt-4 text-xl font-semibold">متصل بنجاح!</p>
                 </div>
               )}
-              <p className="mt-4 text-center text-gray-600 h-10">{statusMessage}</p>
+              <p className="mt-4 text-center text-gray-600 h-10 px-2">{statusMessage}</p>
             </div>
           </Card>
 
