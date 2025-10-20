@@ -14,35 +14,40 @@ const app = express();
 const port = process.env.PORT || 3001;
 
 // Middlewares
-app.use(cors()); // السماح بالطلبات من الواجهة الأمامية
+app.use(cors());
 app.use(bodyParser.json());
+
+// نقطة نهاية بسيطة للتحقق من أن الخادم يعمل ومتاح
+app.get('/', (req, res) => {
+  res.status(200).send('WhatsApp Backend Server is running and reachable!');
+});
 
 // التحقق من وجود مفتاح API الخاص بـ Gemini
 if (!process.env.API_KEY) {
   console.error("API_KEY for Gemini is not set in environment variables.");
-  process.exit(1); // إيقاف الخادم إذا لم يكن المفتاح موجودًا
+  process.exit(1);
 }
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
 // متغيرات لتخزين حالة الاتصال ورمز QR
 let connectionStatus = 'DISCONNECTED';
 let qrCodeDataUrl = null;
-let client; // تعريف العميل هنا ليتم إعادة إنشائه
+let client;
 
-function createWhatsAppClient() {
-  console.log('Creating a new WhatsApp client instance...');
+// دالة مركزية لإنشاء وتهيئة عميل WhatsApp جديد
+function initializeClient() {
+  console.log('Initializing a new WhatsApp client instance...');
   client = new Client({
     authStrategy: new LocalAuth(),
-    // خاصية puppeteer ضرورية للعمل على Render
     puppeteer: {
       args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      headless: true, // تأكد من تشغيله في وضع headless على الخادم
     },
   });
 
   client.on('qr', async (qr) => {
     console.log('QR RECEIVED');
     connectionStatus = 'PENDING_QR_SCAN';
-    // تحويل نص QR إلى صورة بتشفير base64 ليتم عرضها في المتصفح
     qrCodeDataUrl = await qrcode.toDataURL(qr);
   });
 
@@ -56,42 +61,41 @@ function createWhatsAppClient() {
     console.log('Client was logged out', reason);
     connectionStatus = 'DISCONNECTED';
     qrCodeDataUrl = null;
-    // لا تقم بإعادة التهيئة تلقائيًا هنا لتجنب الحلقات اللانهائية
-    // سيتم التحكم في إعادة الاتصال عبر نقطة النهاية /reset
+    // لا تقم بإعادة التهيئة هنا لتجنب المشاكل، دع التحكم للمستخدم عبر /reset
   });
 
   client.on('auth_failure', (msg) => {
     console.error('AUTHENTICATION FAILURE', msg);
     connectionStatus = 'ERROR';
+    qrCodeDataUrl = null;
   });
 
-  client.initialize();
+  console.log('Starting client initialization...');
+  client.initialize().catch(err => {
+    console.error('Client initialization failed:', err);
+    connectionStatus = 'ERROR';
+  });
 }
-
-// إنشاء العميل لأول مرة عند بدء التشغيل
-createWhatsAppClient();
-
 
 // ---- ENDPOINTS API ----
 
-// نقطة نهاية جديدة ومحسّنة لإعادة تعيين جلسة العميل
+// نقطة نهاية محسّنة لإعادة تعيين جلسة العميل
 app.post('/reset', async (req, res) => {
   console.log('Received request to reset client session.');
+  connectionStatus = 'CONNECTING'; // تحديث الحالة فورًا
+  qrCodeDataUrl = null;
+
   try {
-    // 1. تدمير الجلسة الحالية تمامًا
     if (client) {
+      console.log('Destroying previous client instance...');
       await client.destroy();
-      console.log('Previous client session destroyed.');
+      console.log('Previous client instance destroyed.');
     }
   } catch (error) {
-    console.warn('Could not destroy client, it might have been already destroyed or in a bad state. Continuing...');
+    console.warn('Error destroying client, it might have been already down. Continuing with re-initialization.', error.message);
   } finally {
-    // 2. إعادة تعيين متغيرات الحالة وإنشاء عميل جديد ونظيف
-    connectionStatus = 'DISCONNECTED';
-    qrCodeDataUrl = null;
-    createWhatsAppClient(); // هذه الدالة ستقوم بـ initialize
-    console.log('New client instance created and is initializing.');
-    res.status(200).json({ message: 'Client session has been reset successfully.' });
+    initializeClient(); // إنشاء وتهيئة عميل جديد ونظيف
+    res.status(200).json({ message: 'Client session reset initiated.' });
   }
 });
 
@@ -113,9 +117,8 @@ app.post('/generate-message', async (req, res) => {
   try {
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
-      contents: prompt, // إرسال طلب المستخدم مباشرة
+      contents: prompt,
       config: {
-        // استخدام تعليمات النظام لتوجيه النموذج بشكل أفضل
         systemInstruction: 'You are an expert copywriter. Your task is to write a short, friendly, and engaging WhatsApp message in Arabic based on the user\'s request. The message should be concise and ready to be sent.',
         temperature: 0.7,
         topP: 0.95,
@@ -146,7 +149,6 @@ app.post('/send', async (req, res) => {
 
   for (const number of numbers) {
     try {
-      // تنسيق الرقم ليكون متوافقًا مع WhatsApp (e.g., '201234567890@c.us')
       const chatId = `${number.trim()}@c.us`;
       await client.sendMessage(chatId, message);
       successCount++;
@@ -164,6 +166,9 @@ app.post('/send', async (req, res) => {
   });
 });
 
+
+// بدء تشغيل الخادم والعميل لأول مرة
 app.listen(port, () => {
   console.log(`WhatsApp backend server listening on port ${port}`);
+  initializeClient(); // تهيئة العميل عند بدء تشغيل الخادم
 });
