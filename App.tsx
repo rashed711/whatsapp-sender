@@ -53,10 +53,11 @@ const App: React.FC = () => {
       }
     } catch (error) {
       console.error('Polling error:', error);
-      setStatusMessage('خطأ في الاتصال بالخادم. يرجى المحاولة مرة أخرى.');
+      setStatusMessage((error as Error).message || 'خطأ غير معروف في الاتصال بالخادم.');
       setConnectionStatus(ConnectionStatus.ERROR);
       if (intervalRef.current) {
         clearInterval(intervalRef.current);
+        intervalRef.current = null; // هام: إعادة التعيين للسماح بإعادة المحاولة
       }
     }
   }, []);
@@ -64,13 +65,15 @@ const App: React.FC = () => {
   const handleConnect = () => {
     setStatusMessage('جاري طلب رمز QR من الخادم...');
     setSendResult(null);
+    setConnectionStatus(ConnectionStatus.DISCONNECTED); // Reset visual state
     if (!intervalRef.current) {
-      pollStatus();
-      intervalRef.current = setInterval(pollStatus, 3000);
+      pollStatus(); // Call once immediately
+      intervalRef.current = setInterval(pollStatus, 3000); // Then start polling
     }
   };
   
   useEffect(() => {
+    // Cleanup on component unmount
     return () => {
       if (intervalRef.current) {
         clearInterval(intervalRef.current);
@@ -91,7 +94,7 @@ const App: React.FC = () => {
       setMessage(generated);
     } catch (error) {
       console.error('Error generating message:', error);
-      setStatusMessage('حدث خطأ أثناء توليد الرسالة.');
+      setStatusMessage((error as Error).message || 'حدث خطأ أثناء توليد الرسالة.');
     } finally {
       setIsGenerating(false);
     }
@@ -122,7 +125,7 @@ const App: React.FC = () => {
             setSendResult(null);
             setPhoneNumbers('');
             setMessage('');
-        }, 10000); // زيادة الوقت لعرض النتائج
+        }, 10000);
     } catch (error) {
         console.error('Sending error:', error);
         setStatusMessage((error as Error).message || 'حدث خطأ فادح أثناء الإرسال.');
@@ -149,7 +152,7 @@ const App: React.FC = () => {
             <div className="flex flex-col items-center justify-center h-full min-h-[300px]">
               {connectionStatus !== ConnectionStatus.CONNECTED && (
                 <Button onClick={handleConnect} disabled={!!intervalRef.current}>
-                  {!!intervalRef.current ? <Spinner /> : 'الاتصال بـ WhatsApp'}
+                  {!!intervalRef.current ? <><Spinner /> جارٍ الاتصال...</> : 'الاتصال بـ WhatsApp'}
                 </Button>
               )}
               {connectionStatus === ConnectionStatus.PENDING_QR_SCAN && qrCode && (
