@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { generateMessage } from './services/geminiService';
-import { getStatus, sendMessages, resetSession } from './api/whatsappService';
+import { getStatus, sendMessages } from './api/whatsappService';
 import { Card } from './components/Card';
 import { Button } from './components/Button';
 import { Spinner } from './components/Spinner';
@@ -8,6 +8,7 @@ import { WhatsAppIcon, CheckCircleIcon, PaperAirplaneIcon, SparklesIcon } from '
 
 enum ConnectionStatus {
   DISCONNECTED,
+  INITIALIZING,
   CONNECTING,
   PENDING_QR_SCAN,
   CONNECTED,
@@ -20,7 +21,7 @@ interface SendResult {
   failedNumbers?: string[];
 }
 
-const MAX_POLL_RETRIES = 10; // سنحاول 10 مرات (حوالي 30 ثانية) قبل إعلان الفشل
+const MAX_POLL_RETRIES = 12; // سنحاول 12 مرات (حوالي 36 ثانية)
 
 const App: React.FC = () => {
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>(ConnectionStatus.DISCONNECTED);
@@ -32,7 +33,7 @@ const App: React.FC = () => {
   const [isSending, setIsSending] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [sendResult, setSendResult] = useState<SendResult | null>(null);
-  const [serverLogs, setServerLogs] = useState<string[]>([]); // New state for server logs
+  const [serverLogs, setServerLogs] = useState<string[]>([]);
   
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pollRetriesRef = useRef<number>(0);
@@ -45,30 +46,40 @@ const App: React.FC = () => {
   }, []);
 
   const pollStatus = useCallback(async () => {
-    if (connectionStatus === ConnectionStatus.CONNECTED || connectionStatus === ConnectionStatus.ERROR) {
-      stopPolling();
-      return;
-    }
-  
     try {
       const data = await getStatus();
-      pollRetriesRef.current = 0;
+      pollRetriesRef.current = 0; // Reset retries on successful fetch
   
       if (data.logs) {
-        setServerLogs(data.logs); // Update server logs state
+        setServerLogs(data.logs);
       }
 
-      if (data.status === 'CONNECTED') {
-        setConnectionStatus(ConnectionStatus.CONNECTED);
-        setQrCode(null);
-        setStatusMessage('تم الاتصال بنجاح!');
-        stopPolling();
-      } else if (data.status === 'PENDING_QR_SCAN') {
-        setConnectionStatus(ConnectionStatus.PENDING_QR_SCAN);
-        setQrCode(data.qrCode);
-        setStatusMessage('يرجى مسح الرمز ضوئيًا باستخدام WhatsApp.');
-      } else if (connectionStatus === ConnectionStatus.CONNECTING) {
-        setStatusMessage('في انتظار رمز QR من الخادم...');
+      switch (data.status) {
+        case 'CONNECTED':
+          setConnectionStatus(ConnectionStatus.CONNECTED);
+          setQrCode(null);
+          setStatusMessage('تم الاتصال بنجاح!');
+          stopPolling();
+          break;
+        case 'PENDING_QR_SCAN':
+          setConnectionStatus(ConnectionStatus.PENDING_QR_SCAN);
+          setQrCode(data.qrCode);
+          setStatusMessage('يرجى مسح الرمز ضوئيًا باستخدام WhatsApp.');
+          break;
+        case 'CONNECTING':
+        case 'INITIALIZING':
+          setConnectionStatus(ConnectionStatus.CONNECTING);
+          setStatusMessage('جاري تهيئة الاتصال على الخادم، يرجى الانتظار...');
+          break;
+        case 'ERROR':
+            setConnectionStatus(ConnectionStatus.ERROR);
+            setStatusMessage('حدث خطأ في الخادم. قد يحاول إعادة التشغيل تلقائيًا.');
+            // لا نوقف الاستعلام هنا، لنرى إذا كان الخادم سيصلح نفسه
+            break;
+        default:
+          setConnectionStatus(ConnectionStatus.DISCONNECTED);
+          setStatusMessage('الخادم غير متصل. اضغط للاتصال.');
+          stopPolling();
       }
     } catch (error) {
       pollRetriesRef.current += 1;
@@ -81,31 +92,24 @@ const App: React.FC = () => {
         stopPolling();
       }
     }
-  }, [stopPolling, connectionStatus]);
+  }, [stopPolling]);
 
   const handleConnect = async () => {
     setConnectionStatus(ConnectionStatus.CONNECTING);
-    setStatusMessage('جاري إعادة تعيين الجلسة السابقة...');
+    setStatusMessage('جاري طلب الحالة من الخادم...');
     setSendResult(null);
     setQrCode(null);
-    setServerLogs([]); // Clear logs on new connection attempt
+    setServerLogs([]);
     pollRetriesRef.current = 0;
     
     stopPolling();
-
-    try {
-      await resetSession();
-      setStatusMessage('جاري الاتصال بالخادم... قد يستغرق الأمر ما يصل إلى 50 ثانية.');
-      pollStatus();
-      intervalRef.current = setInterval(pollStatus, 3000);
-    } catch (error) {
-      console.error('Failed to reset session:', error);
-      setStatusMessage((error as Error).message || 'فشل في بدء جلسة جديدة على الخادم.');
-      setConnectionStatus(ConnectionStatus.ERROR);
-    }
+    // ابدأ الاستعلام فورًا ثم قم بتعيين الفاصل الزمني
+    pollStatus(); 
+    intervalRef.current = setInterval(pollStatus, 3000);
   };
   
   useEffect(() => {
+    // Cleanup on component unmount
     return () => {
       stopPolling();
     };
@@ -184,7 +188,7 @@ const App: React.FC = () => {
             <div className="flex flex-col items-center justify-center min-h-[300px]">
               {connectionStatus !== ConnectionStatus.CONNECTED && (
                 <Button onClick={handleConnect} disabled={isConnectButtonDisabled}>
-                  {connectionStatus === ConnectionStatus.CONNECTING || connectionStatus === ConnectionStatus.PENDING_QR_SCAN 
+                  {isConnectButtonDisabled
                     ? <><Spinner /> جارٍ الاتصال...</> 
                     : 'الاتصال بـ WhatsApp'}
                 </Button>
@@ -201,7 +205,6 @@ const App: React.FC = () => {
               <p className="mt-4 text-center text-gray-600 h-10 px-2">{statusMessage}</p>
             </div>
             
-            {/* Server Logs Section */}
             {serverLogs.length > 0 && (
               <div className="mt-6 border-t pt-4">
                 <h3 className="text-md font-semibold text-gray-600 mb-2 text-center">سجلات الخادم الحية</h3>
