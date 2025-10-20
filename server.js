@@ -28,7 +28,7 @@ const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
 let client;
 let qrCodeDataUrl = null;
-let isInitializing = false;
+let clientStatus = 'DISCONNECTED'; // مصدر الحقيقة الوحيد للحالة
 let serverLogs = [];
 
 const addLog = (message) => {
@@ -43,13 +43,14 @@ const addLog = (message) => {
 
 // الدالة المركزية والوحيدة لإدارة وتشغيل عميل WhatsApp
 async function startWhatsAppClient() {
-  if (client || isInitializing) {
+  // منع التشغيل المتعدد
+  if (client || clientStatus === 'INITIALIZING' || clientStatus === 'CONNECTING') {
     addLog('Start request ignored: Client is already running or initializing.');
     return;
   }
 
   addLog('Attempting to initialize a new WhatsApp client...');
-  isInitializing = true;
+  clientStatus = 'INITIALIZING';
   qrCodeDataUrl = null;
 
   client = new Client({
@@ -60,36 +61,42 @@ async function startWhatsAppClient() {
     },
   });
 
+  // إدارة الحالة المستندة إلى الأحداث
   client.on('qr', async (qr) => {
     addLog('QR Code received. Waiting for scan.');
     qrCodeDataUrl = await qrcode.toDataURL(qr);
+    clientStatus = 'PENDING_QR_SCAN';
+  });
+
+  client.on('authenticated', () => {
+    addLog('Authentication successful! Finalizing connection...');
+    qrCodeDataUrl = null; // لم نعد بحاجة إلى رمز QR
+    clientStatus = 'CONNECTING'; // حالة وسيطة دقيقة للواجهة الأمامية
   });
 
   client.on('ready', () => {
     addLog('Client is ready! Connection successful.');
-    qrCodeDataUrl = null;
-    isInitializing = false;
+    clientStatus = 'CONNECTED';
   });
 
   client.on('disconnected', async (reason) => {
-    addLog(`Client disconnected. Reason: ${reason}. Destroying instance and attempting to restart.`);
+    addLog(`Client disconnected. Reason: ${reason}. Destroying instance.`);
     if (client) {
       await client.destroy().catch(e => addLog(`Error destroying client on disconnect: ${e.message}`));
     }
     client = null;
-    isInitializing = false;
     qrCodeDataUrl = null;
-    // سنقوم بإعادة التشغيل تلقائيًا عند الطلب التالي لـ /status
+    clientStatus = 'DISCONNECTED';
   });
 
   client.on('auth_failure', async (msg) => {
-    addLog(`Authentication Failure: ${msg}. Session is invalid. Destroying instance.`);
+    addLog(`Authentication Failure: ${msg}. Session invalid. Destroying instance.`);
     if (client) {
         await client.destroy().catch(e => addLog(`Error destroying client on auth_failure: ${e.message}`));
     }
     client = null;
-    isInitializing = false;
     qrCodeDataUrl = null;
+    clientStatus = 'ERROR'; // حالة خطأ واضحة
   });
 
   try {
@@ -100,56 +107,25 @@ async function startWhatsAppClient() {
       await client.destroy().catch(e => addLog(`Error destroying client after init fail: ${e.message}`));
     }
     client = null;
-    isInitializing = false;
+    qrCodeDataUrl = null;
+    clientStatus = 'ERROR';
   }
 }
 
 // ---- ENDPOINTS API ----
 
-// نقطة النهاية /status أصبحت الآن "ذكية" وتقوم بالإصلاح الذاتي
-app.get('/status', async (req, res) => {
-    // الأولوية 1: إذا كان العميل موجودًا، تحقق من حالته الحقيقية أولاً.
-    if (client) {
-        try {
-            const state = await client.getState();
-            if (state === 'CONNECTED') {
-                // آلية أمان: إذا كان متصلاً، تأكد من مسح رمز QR وأبلغ الواجهة بالحقيقة.
-                if (qrCodeDataUrl) {
-                    addLog('Failsafe triggered: Client is CONNECTED but QR was still present. Clearing QR.');
-                    qrCodeDataUrl = null;
-                }
-                return res.json({ status: 'CONNECTED', qrCode: null, logs: serverLogs });
-            }
-        } catch (error) {
-            addLog(`Health check failed: ${error.message}. Client presumed dead.`);
-            client = null;
-            isInitializing = false;
-            qrCodeDataUrl = null; // تأكد من التنظيف
-            return res.json({ status: 'ERROR', qrCode: null, logs: serverLogs });
-        }
-    }
-
-    // إذا وصلنا إلى هنا، فالعميل ليس في حالة "CONNECTED"
-    // الأولوية 2: إذا كان هناك رمز QR جاهز، أرسله.
-    if (qrCodeDataUrl) {
-        return res.json({ status: 'PENDING_QR_SCAN', qrCode: qrCodeDataUrl, logs: serverLogs });
-    }
-
-    // الأولوية 3: إذا كانت العملية قيد التهيئة (لكن لا يوجد عميل أو QR بعد)، أبلغ بذلك.
-    if (isInitializing) {
-        return res.json({ status: 'CONNECTING', qrCode: null, logs: serverLogs });
-    }
-
-    // الأولوية 4: إذا لم يكن هناك شيء يحدث على الإطلاق، ابدأ العملية.
-    if (!client && !isInitializing) {
+// نقطة النهاية /status أصبحت الآن "مراسلاً" بسيطًا وموثوقًا به
+app.get('/status', (req, res) => {
+    // آلية الإصلاح الذاتي: إذا كان العميل غير متصل تمامًا، ابدأ عملية إعادة الاتصال.
+    if (clientStatus === 'DISCONNECTED') {
         startWhatsAppClient();
+        // أبلغ الواجهة فورًا بأننا بدأنا التهيئة.
         return res.json({ status: 'INITIALIZING', qrCode: null, logs: serverLogs });
     }
-
-    // حالة احتياطية: لا ينبغي الوصول إليها عادةً.
-    return res.json({ status: 'DISCONNECTED', qrCode: null, logs: serverLogs });
+    
+    // لأي حالة أخرى، ما عليك سوى إبلاغ الواجهة بالحالة الحالية المسجلة.
+    res.json({ status: clientStatus, qrCode: qrCodeDataUrl, logs: serverLogs });
 });
-
 
 app.post('/generate-message', async (req, res) => {
   const { prompt } = req.body;
@@ -176,20 +152,12 @@ app.post('/generate-message', async (req, res) => {
 
 app.post('/send', async (req, res) => {
   const { numbers, message } = req.body;
-  if (!client) {
-    return res.status(400).json({ error: 'عميل WhatsApp غير مهيأ. يرجى الاتصال أولاً.' });
-  }
-  try {
-    const currentState = await client.getState();
-    if (currentState !== 'CONNECTED') {
-      const errorMsg = `عميل WhatsApp ليس جاهزًا. الحالة الحالية: ${currentState || 'غير معروف'}`;
-      addLog(`Send failed: ${errorMsg}`);
-      return res.status(400).json({ error: errorMsg });
-    }
-  } catch (error) {
-    const errorMsg = 'تعذر التحقق من حالة اتصال WhatsApp. قد تكون الخدمة قيد إعادة التشغيل.';
-    addLog(`Send failed: ${errorMsg} - ${error.message}`);
-    return res.status(500).json({ error: errorMsg });
+  
+  // التحقق من الحالة أصبح الآن أسرع وأكثر كفاءة
+  if (clientStatus !== 'CONNECTED') {
+    const errorMsg = `عميل WhatsApp ليس جاهزًا. الحالة الحالية: ${clientStatus}`;
+    addLog(`Send failed: ${errorMsg}`);
+    return res.status(400).json({ error: errorMsg });
   }
 
   if (!numbers || !message || !Array.isArray(numbers) || numbers.length === 0) {
