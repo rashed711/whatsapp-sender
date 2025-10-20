@@ -1,6 +1,6 @@
 // هام: استبدل هذا الرابط بالرابط الذي ستحصل عليه من Render.com
 // مثال: 'https://my-whatsapp-sender.onrender.com'
-const BACKEND_URL = 'https://your-whatsapp-backend.onrender.com';
+const BACKEND_URL = 'https://whatsapp-sender-etav.onrender.com';
 
 /**
  * جلب الحالة الحالية للاتصال ورمز QR من الخادم.
