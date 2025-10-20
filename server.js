@@ -108,41 +108,48 @@ async function startWhatsAppClient() {
 
 // نقطة النهاية /status أصبحت الآن "ذكية" وتقوم بالإصلاح الذاتي
 app.get('/status', async (req, res) => {
-  // إذا لم يكن هناك عميل ولا تتم عملية تهيئة، ابدأ واحدة جديدة
-  if (!client && !isInitializing) {
-    startWhatsAppClient();
-    return res.json({ status: 'INITIALIZING', qrCode: null, logs: serverLogs });
-  }
-
-  // إذا كانت قيد التهيئة ولكن لا يوجد QR بعد
-  if (isInitializing && !qrCodeDataUrl) {
-    return res.json({ status: 'CONNECTING', qrCode: null, logs: serverLogs });
-  }
-
-  // إذا كان هناك رمز QR جاهز للمسح
-  if (qrCodeDataUrl) {
-    return res.json({ status: 'PENDING_QR_SCAN', qrCode: qrCodeDataUrl, logs: serverLogs });
-  }
-
-  // إذا كان هناك عميل، تحقق من حالته الحقيقية
-  if (client) {
-    try {
-      const state = await client.getState();
-      if (state === 'CONNECTED') {
-        return res.json({ status: 'CONNECTED', qrCode: null, logs: serverLogs });
-      }
-    } catch (error) {
-      addLog(`Health check failed: ${error.message}. Client presumed dead.`);
-      // تموت العميل، قم بتنظيفه لكي يتم إعادة تشغغيله في الطلب التالي
-      client = null; 
-      isInitializing = false;
-      return res.json({ status: 'ERROR', qrCode: null, logs: serverLogs });
+    // الأولوية 1: إذا كان العميل موجودًا، تحقق من حالته الحقيقية أولاً.
+    if (client) {
+        try {
+            const state = await client.getState();
+            if (state === 'CONNECTED') {
+                // آلية أمان: إذا كان متصلاً، تأكد من مسح رمز QR وأبلغ الواجهة بالحقيقة.
+                if (qrCodeDataUrl) {
+                    addLog('Failsafe triggered: Client is CONNECTED but QR was still present. Clearing QR.');
+                    qrCodeDataUrl = null;
+                }
+                return res.json({ status: 'CONNECTED', qrCode: null, logs: serverLogs });
+            }
+        } catch (error) {
+            addLog(`Health check failed: ${error.message}. Client presumed dead.`);
+            client = null;
+            isInitializing = false;
+            qrCodeDataUrl = null; // تأكد من التنظيف
+            return res.json({ status: 'ERROR', qrCode: null, logs: serverLogs });
+        }
     }
-  }
 
-  // الحالة الافتراضية إذا لم ينطبق أي مما سبق
-  return res.json({ status: 'DISCONNECTED', qrCode: null, logs: serverLogs });
+    // إذا وصلنا إلى هنا، فالعميل ليس في حالة "CONNECTED"
+    // الأولوية 2: إذا كان هناك رمز QR جاهز، أرسله.
+    if (qrCodeDataUrl) {
+        return res.json({ status: 'PENDING_QR_SCAN', qrCode: qrCodeDataUrl, logs: serverLogs });
+    }
+
+    // الأولوية 3: إذا كانت العملية قيد التهيئة (لكن لا يوجد عميل أو QR بعد)، أبلغ بذلك.
+    if (isInitializing) {
+        return res.json({ status: 'CONNECTING', qrCode: null, logs: serverLogs });
+    }
+
+    // الأولوية 4: إذا لم يكن هناك شيء يحدث على الإطلاق، ابدأ العملية.
+    if (!client && !isInitializing) {
+        startWhatsAppClient();
+        return res.json({ status: 'INITIALIZING', qrCode: null, logs: serverLogs });
+    }
+
+    // حالة احتياطية: لا ينبغي الوصول إليها عادةً.
+    return res.json({ status: 'DISCONNECTED', qrCode: null, logs: serverLogs });
 });
+
 
 app.post('/generate-message', async (req, res) => {
   const { prompt } = req.body;
