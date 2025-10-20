@@ -1,0 +1,5 @@
+{
+  "name": "WhatsApp Bulk Messenger with AI",
+  "description": "An application to connect to WhatsApp via QR code and send bulk messages to a list of phone numbers, with an AI-powered message generator.",
+  "requestFramePermissions": []
+}
